@@ -466,3 +466,55 @@ class TestBOC:
             send("assert", (r.value, 42))
 
         self.receive_asserts()
+
+    def test_cown_of_cown_direct(self):
+        """CownCapsule as direct child of a Cown survives release/acquire."""
+        inner = Cown(42)
+        outer = Cown(inner)
+
+        @when(outer)
+        def read_outer(o):
+            send("assert", (type(o.value).__name__, "CownCapsule"))
+
+        self.receive_asserts()
+
+    def test_cown_of_cown_access_inner(self):
+        """Inner cown's value is accessible after outer round-trip."""
+        inner = Cown(99)
+        outer = Cown(inner)
+
+        @when(outer, inner)
+        def check_both(o, i):
+            send("assert", (i.value, 99))
+
+        self.receive_asserts()
+
+    def test_cown_of_cown_in_container(self):
+        """CownCapsule nested in a dict survives pickle round-trip."""
+        inner = Cown(7)
+        outer = Cown({"key": inner})
+
+        @when(outer)
+        def check_container(o):
+            send("assert", (type(o.value["key"]).__name__, "CownCapsule"))
+
+        self.receive_asserts()
+
+    def test_cown_of_cown_schedule_inner(self):
+        """Extract inner cown from outer and schedule a behavior on it."""
+        inner = Cown(10)
+        outer = Cown(inner)
+
+        @when(outer)
+        def extract(o):
+            return o.value
+
+        @when(extract)
+        def schedule_on_inner(r):
+            inner_cown = Cown(r.value)
+
+            @when(inner_cown)
+            def read_inner(i):
+                send("assert", (i.value, 10))
+
+        self.receive_asserts()
