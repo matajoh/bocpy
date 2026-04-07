@@ -1,3 +1,22 @@
+## 2026-04-02 - Version 0.3.1
+CownCapsule serialization support for nested cowns.
+
+**Bug Fixes**
+
+- Removed the ownership check in `_cown_shared` that prevented a
+  `CownCapsule` from being serialized to XIData when it was the value
+  of another `Cown`. The check was unnecessary — `_cown_shared` only
+  stores a pointer and ownership is enforced at acquire time.
+
+**Improvements**
+
+- Added `CownCapsule.__reduce__` with `COWN_INCREF` pinning so that a
+  `CownCapsule` embedded in a container (dict, list, etc.) can survive
+  the pickle round-trip used by `object_to_xidata`. A module-level
+  reconstructor (`_cown_capsule_from_pointer`) inherits the pin without
+  a redundant `COWN_INCREF`, and validates the process ID on unpickle to
+  guard against cross-process misuse.
+
 ## 2026-04-01 - Version 0.3.0
 Spin-then-park receive; free-threaded Python compatibility.
 

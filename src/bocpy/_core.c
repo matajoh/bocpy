@@ -7,6 +7,7 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#include <process.h>
 #include <windows.h>
 typedef volatile int_least64_t atomic_int_least64_t;
 typedef volatile intptr_t atomic_intptr_t;
@@ -139,6 +140,7 @@ atomic_int_least64_t BOC_COWN_COUNT = 0;
 #define boc_yield() SwitchToThread()
 #else
 #include <sched.h>
+#include <unistd.h>
 #define boc_yield() sched_yield()
 #endif
 
@@ -1564,6 +1566,75 @@ static PyObject *CownCapsule_get_impl(PyObject *op, void *Py_UNUSED(dummy)) {
   return Py_NewRef(op);
 }
 
+/// @brief Pickle support for CownCapsule
+/// @details Pins the inner BOCCown via COWN_INCREF so it stays alive between
+/// pickle and unpickle. The reconstructor inherits this pin (no extra INCREF).
+/// @param op The CownCapsule object
+/// @param Py_UNUSED (ignored)
+/// @return A tuple (reconstructor, (pointer, pid)) for pickle, or NULL on error
+static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  CownCapsuleObject *self = (CownCapsuleObject *)op;
+  BOCCown *cown = self->cown;
+
+  // pin the cown alive through the pickle/unpickle cycle
+  COWN_INCREF(cown);
+
+  PyObject *ptr = PyLong_FromVoidPtr(cown);
+  if (ptr == NULL) {
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+#ifdef _WIN32
+  long pid = (long)_getpid();
+#else
+  long pid = (long)getpid();
+#endif
+  PyObject *pid_obj = PyLong_FromLong(pid);
+  if (pid_obj == NULL) {
+    Py_DECREF(ptr);
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  PyObject *module = PyImport_ImportModule("bocpy._core");
+  if (module == NULL) {
+    Py_DECREF(pid_obj);
+    Py_DECREF(ptr);
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  PyObject *reconstructor =
+      PyObject_GetAttrString(module, "_cown_capsule_from_pointer");
+  Py_DECREF(module);
+  if (reconstructor == NULL) {
+    Py_DECREF(pid_obj);
+    Py_DECREF(ptr);
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  PyObject *args = PyTuple_Pack(2, ptr, pid_obj);
+  Py_DECREF(ptr);
+  Py_DECREF(pid_obj);
+  if (args == NULL) {
+    Py_DECREF(reconstructor);
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  PyObject *result = PyTuple_Pack(2, reconstructor, args);
+  Py_DECREF(reconstructor);
+  Py_DECREF(args);
+  if (result == NULL) {
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  return result;
+}
+
 static PyMethodDef CownCapsule_methods[] = {
     {"get", CownCapsule_get, METH_NOARGS, NULL},
     {"set", CownCapsule_set, METH_VARARGS, NULL},
@@ -1571,6 +1642,7 @@ static PyMethodDef CownCapsule_methods[] = {
     {"acquire", CownCapsule_acquire, METH_NOARGS, NULL},
     {"release", CownCapsule_release, METH_NOARGS, NULL},
     {"disown", CownCapsule_disown, METH_NOARGS, NULL},
+    {"__reduce__", CownCapsule_reduce, METH_NOARGS, NULL},
     {NULL} /* Sentinel */
 };
 
@@ -1751,11 +1823,6 @@ static int _cown_shared(
 
   CownCapsuleObject *capsule = (CownCapsuleObject *)obj;
   BOCCown *cown = capsule->cown;
-
-  if (atomic_load(&cown->owner) != NO_OWNER) {
-    PyErr_SetString(PyExc_RuntimeError, "cown must be released before sending");
-    return -1;
-  }
 
   PRINTDBG("_cown_shared(%p)\n", cown);
 
@@ -3635,6 +3702,56 @@ static PyObject *_core_set_tags(PyObject *module, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+/// @brief Reconstructs a CownCapsule from a pickled pointer
+/// @details Used by CownCapsule.__reduce__ to unpickle. Inherits the
+/// COWN_INCREF pin from __reduce__ (no additional INCREF). Must not use
+/// cown_capsule_wrap which would double-INCREF.
+/// @param module The _core module (unused)
+/// @param args Tuple of (pointer_as_int, process_id)
+/// @return A new CownCapsule, or NULL on error
+static PyObject *_cown_capsule_from_pointer(PyObject *module, PyObject *args) {
+  PyObject *ptr_obj, *pid_obj;
+  if (!PyArg_ParseTuple(args, "OO", &ptr_obj, &pid_obj)) {
+    return NULL;
+  }
+
+  long pickled_pid = PyLong_AsLong(pid_obj);
+  if (pickled_pid == -1 && PyErr_Occurred()) {
+    return NULL;
+  }
+
+#ifdef _WIN32
+  long current_pid = (long)_getpid();
+#else
+  long current_pid = (long)getpid();
+#endif
+  if (pickled_pid != current_pid) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "CownCapsule cannot be unpickled in a different process");
+    return NULL;
+  }
+
+  BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(ptr_obj);
+  if (cown == NULL) {
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_ValueError, "Invalid cown pointer");
+    }
+    return NULL;
+  }
+
+  // manually allocate without cown_capsule_wrap to avoid double INCREF;
+  // inherits the pin from __reduce__
+  PyTypeObject *type = BOC_STATE->cown_capsule_type;
+  CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
+  if (capsule == NULL) {
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  capsule->cown = cown;
+  return (PyObject *)capsule;
+}
+
 static PyMethodDef _core_module_methods[] = {
     {"send", _core_send, METH_VARARGS, NULL},
     {"receive", (PyCFunction)(void (*)(void))_core_receive,
@@ -3650,6 +3767,8 @@ static PyMethodDef _core_module_methods[] = {
     {"recycle", _core_recycle, METH_NOARGS, NULL},
     {"cowns", _core_cowns, METH_NOARGS, NULL},
     {"set_tags", _core_set_tags, METH_VARARGS, NULL},
+    {"_cown_capsule_from_pointer", _cown_capsule_from_pointer, METH_VARARGS,
+     NULL},
     {NULL} /* Sentinel */
 };
 
