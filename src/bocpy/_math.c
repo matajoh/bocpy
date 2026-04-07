@@ -1692,31 +1692,61 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
 }
 
 static PyMethodDef Matrix_methods[] = {
-    {"transpose", Matrix_transpose, METH_NOARGS, NULL},
-    {"transpose_in_place", Matrix_transpose_in_place, METH_NOARGS, NULL},
-    {"sum", Matrix_Sum_method, METH_VARARGS, NULL},
-    {"mean", Matrix_Mean_method, METH_VARARGS, NULL},
-    {"magnitude", Matrix_Magnitude_method, METH_VARARGS, NULL},
-    {"min", Matrix_Minimum_method, METH_VARARGS, NULL},
-    {"max", Matrix_Maximum_method, METH_VARARGS, NULL},
-    {"ceil", Matrix_Ceil_method, METH_NOARGS, NULL},
-    {"floor", Matrix_Floor_method, METH_NOARGS, NULL},
-    {"round", Matrix_Round_method, METH_NOARGS, NULL},
-    {"negate", Matrix_Negate_method, METH_NOARGS, NULL},
-    {"abs", Matrix_Abs_method, METH_NOARGS, NULL},
-    {"clip", Matrix_clip, METH_VARARGS, NULL},
-    {"copy", Matrix_copy, METH_NOARGS, NULL},
-    {"select", Matrix_select, METH_VARARGS, NULL},
+    {"transpose", Matrix_transpose, METH_NOARGS,
+     "transpose($self, /)\n--\n\nReturn a transposed copy."},
+    {"transpose_in_place", Matrix_transpose_in_place, METH_NOARGS,
+     "transpose_in_place($self, /)\n--\n\nTranspose in place."},
+    {"sum", Matrix_Sum_method, METH_VARARGS,
+     "sum($self, /, axis=None)\n--\n\nSum of elements."},
+    {"mean", Matrix_Mean_method, METH_VARARGS,
+     "mean($self, /, axis=None)\n--\n\nMean of elements."},
+    {"magnitude", Matrix_Magnitude_method, METH_VARARGS,
+     "magnitude($self, /, axis=None)\n--\n\nEuclidean magnitude."},
+    {"min", Matrix_Minimum_method, METH_VARARGS,
+     "min($self, /, axis=None)\n--\n\nMinimum of elements."},
+    {"max", Matrix_Maximum_method, METH_VARARGS,
+     "max($self, /, axis=None)\n--\n\nMaximum of elements."},
+    {"ceil", Matrix_Ceil_method, METH_NOARGS,
+     "ceil($self, /)\n--\n\nElement-wise ceiling."},
+    {"floor", Matrix_Floor_method, METH_NOARGS,
+     "floor($self, /)\n--\n\nElement-wise floor."},
+    {"round", Matrix_Round_method, METH_NOARGS,
+     "round($self, /)\n--\n\nElement-wise rounding."},
+    {"negate", Matrix_Negate_method, METH_NOARGS,
+     "negate($self, /)\n--\n\nElement-wise negation."},
+    {"abs", Matrix_Abs_method, METH_NOARGS,
+     "abs($self, /)\n--\n\nElement-wise absolute value."},
+    {"clip", Matrix_clip, METH_VARARGS,
+     "clip($self, min_or_maxval, /, maxval=None)\n--\n\n"
+     "Clip elements to a range."},
+    {"copy", Matrix_copy, METH_NOARGS,
+     "copy($self, /)\n--\n\nReturn a deep copy."},
+    {"select", Matrix_select, METH_VARARGS,
+     "select($self, indices, /, axis=0)\n--\n\n"
+     "Select rows or columns by index."},
     {"allclose", (PyCFunction)Matrix_allclose,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS, NULL},
-    {"zeros", Matrix_zeros, METH_VARARGS | METH_CLASS, NULL},
-    {"ones", Matrix_ones, METH_VARARGS | METH_CLASS, NULL},
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "allclose($type, lhs, rhs, /, rtol=1e-05, atol=1e-08, "
+     "equal_nan=False)\n--\n\n"
+     "Check element-wise equality within tolerance."},
+    {"zeros", Matrix_zeros, METH_VARARGS | METH_CLASS,
+     "zeros($type, size, /)\n--\n\nCreate a zero-filled matrix."},
+    {"ones", Matrix_ones, METH_VARARGS | METH_CLASS,
+     "ones($type, size, /)\n--\n\nCreate a matrix of ones."},
     {"normal", (PyCFunction)Matrix_normal,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS, NULL},
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "normal($type, mean=0.0, stddev=1.0, /, size=None)\n--\n\n"
+     "Sample from a normal distribution."},
     {"uniform", (PyCFunction)Matrix_uniform,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS, NULL},
-    {"vector", Matrix_vector, METH_VARARGS | METH_CLASS, NULL},
-    {"concat", Matrix_concat, METH_VARARGS | METH_CLASS, NULL},
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "uniform($type, minval=0.0, maxval=1.0, /, size=None)\n--\n\n"
+     "Sample from a uniform distribution."},
+    {"vector", Matrix_vector, METH_VARARGS | METH_CLASS,
+     "vector($type, values, /, as_column=False)\n--\n\n"
+     "Create a vector from a sequence."},
+    {"concat", Matrix_concat, METH_VARARGS | METH_CLASS,
+     "concat($type, values, /, axis=0)\n--\n\n"
+     "Concatenate matrices along an axis."},
     {NULL} /* Sentinel */
 };
 
@@ -2417,6 +2447,8 @@ static PyObject *Matrix_repr(PyObject *op) {
 }
 
 static PyType_Slot Matrix_slots[] = {
+    {Py_tp_doc, "Matrix(rows, columns, values=None)\n--\n\n"
+                "A dense 2-D matrix of double-precision floats."},
     {Py_tp_new, Matrix_new},
     {Py_tp_init, Matrix_init},
     {Py_tp_dealloc, Matrix_dealloc},

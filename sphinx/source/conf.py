@@ -22,7 +22,6 @@ release = '0.3.1'
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
-    "enum_tools.autoenum",
     "sphinx_autodoc_typehints"
 ]
 
@@ -186,7 +185,17 @@ def _stub_docstring_hook(app, what, name, obj, options, lines):
 
 
 def _stub_signature_hook(app, what, name, obj, options, sig, return_annotation):
-    """Inject signatures from .pyi for C extension objects."""
+    """Inject signatures from .pyi for C extension objects.
+
+    Skips properties (they have no callable signature) and objects that
+    already have a signature from __text_signature__ introspection.
+    """
+    if what in ("attribute", "property"):
+        return None
+
+    if sig is not None:
+        return None
+
     parts = name.split(".")
     if len(parts) >= 2 and parts[0] == "bocpy":
         parts = parts[1:]

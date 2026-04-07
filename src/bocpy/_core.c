@@ -3753,10 +3753,14 @@ static PyObject *_cown_capsule_from_pointer(PyObject *module, PyObject *args) {
 }
 
 static PyMethodDef _core_module_methods[] = {
-    {"send", _core_send, METH_VARARGS, NULL},
+    {"send", _core_send, METH_VARARGS,
+     "send($module, tag, contents, /)\n--\n\nSends a message."},
     {"receive", (PyCFunction)(void (*)(void))_core_receive,
-     METH_VARARGS | METH_KEYWORDS, NULL},
-    {"drain", _core_drain, METH_VARARGS, NULL},
+     METH_VARARGS | METH_KEYWORDS,
+     "receive($module, tags, /, timeout=-1, after=None)\n--\n\n"
+     "Receives a message."},
+    {"drain", _core_drain, METH_VARARGS,
+     "drain($module, tags, /)\n--\n\nDrains all messages for the given tags."},
     {"request_create", request_create, METH_VARARGS, NULL},
     {"request_release", request_release, METH_VARARGS, NULL},
     {"request_start_enqueue", request_start_enqueue, METH_VARARGS, NULL},
@@ -3766,7 +3770,8 @@ static PyMethodDef _core_module_methods[] = {
     {"index", _core_index, METH_NOARGS, NULL},
     {"recycle", _core_recycle, METH_NOARGS, NULL},
     {"cowns", _core_cowns, METH_NOARGS, NULL},
-    {"set_tags", _core_set_tags, METH_VARARGS, NULL},
+    {"set_tags", _core_set_tags, METH_VARARGS,
+     "set_tags($module, tags, /)\n--\n\nAssigns tags to message queues."},
     {"_cown_capsule_from_pointer", _cown_capsule_from_pointer, METH_VARARGS,
      NULL},
     {NULL} /* Sentinel */
