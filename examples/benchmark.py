@@ -170,6 +170,8 @@ class RepeatResult:
     elapsed_s: float
     throughput: float
     wall_clock_ns_start: int
+    scheduler_stats: Optional[list] = None
+    queue_stats: Optional[list] = None
 
 
 @dataclass
@@ -383,6 +385,15 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
             raise RuntimeError("snap behavior did not publish in time")
         _, total = msg
         elapsed_s = t_snap_received - t_measure_start
+
+        # Snapshot scheduler / queue counters BEFORE wait() tears the
+        # runtime down. wait() frees the per-worker array, after
+        # which scheduler_stats() returns an empty list.
+        from bocpy import _core
+        sched_stats_snap = _core.scheduler_stats()
+        queue_stats_snap = (
+            _core.queue_stats() if hasattr(_core, "queue_stats") else None
+        )
     finally:
         # Drop bare-Cown locals before wait().
         del rings
@@ -394,7 +405,9 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
                         completed_behaviors=int(total),
                         elapsed_s=elapsed_s,
                         throughput=throughput,
-                        wall_clock_ns_start=wall_clock_ns_start)
+                        wall_clock_ns_start=wall_clock_ns_start,
+                        scheduler_stats=sched_stats_snap,
+                        queue_stats=queue_stats_snap)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +443,12 @@ def cfg_to_argv(cfg: BenchConfig) -> list:
     return args
 
 
+# Sidechannel: the parent passes its --emit-scheduler-stats flag down
+# to the child via an env var so cfg_to_argv stays a pure function of
+# BenchConfig (the flag is a reporting concern, not a workload knob).
+BOCPY_BENCH_EMIT_SCHED_STATS_ENV = "BOCPY_BENCH_EMIT_SCHED_STATS"
+
+
 def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
                       git_sha: Optional[str]) -> RepeatResult:
     """Run one repeat in a fresh subprocess and return its result.
@@ -446,8 +465,12 @@ def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
     if git_sha is not None:
         env["BOCPY_BENCH_GIT_SHA"] = git_sha
 
+    extra = []
+    if env.get(BOCPY_BENCH_EMIT_SCHED_STATS_ENV) == "1":
+        extra.append("--emit-scheduler-stats")
+
     cmd = [sys.executable, "-m", "bocpy.examples.benchmark",
-           "--json-stdout"] + cfg_to_argv(cfg)
+           "--json-stdout"] + cfg_to_argv(cfg) + extra
     timeout = max(cfg.duration * 3 + 30, cfg.duration + cfg.warmup + 60)
     try:
         proc = subprocess.run(cmd, env=env, capture_output=True,
@@ -473,7 +496,9 @@ def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
         completed_behaviors=int(payload["completed_behaviors"]),
         elapsed_s=float(payload["elapsed_s"]),
         throughput=float(payload["throughput"]),
-        wall_clock_ns_start=int(payload["wall_clock_ns_start"]))
+        wall_clock_ns_start=int(payload["wall_clock_ns_start"]),
+        scheduler_stats=payload.get("scheduler_stats"),
+        queue_stats=payload.get("queue_stats"))
 
 
 def _extract_sentinel_payload(stdout: str) -> Optional[dict]:
@@ -959,6 +984,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--table", dest="table", action="store_true", default=None)
     p.add_argument("--no-table", dest="table", action="store_false")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--emit-scheduler-stats", dest="emit_scheduler_stats",
+                   action="store_true", default=False,
+                   help="Capture _core.scheduler_stats() and "
+                        "_core.queue_stats() snapshots after each "
+                        "repeat and embed them in the result JSON.")
     p.add_argument("--json-stdout", action="store_true",
                    help="Run a single point and print sentinel-framed "
                         "JSON to stdout (subprocess internal).")
@@ -1018,6 +1048,12 @@ def child_main(args) -> int:
         "throughput": rep.throughput,
         "wall_clock_ns_start": rep.wall_clock_ns_start,
     }
+    if args.emit_scheduler_stats:
+        # Read from the snapshot taken INSIDE run_single_point_body,
+        # before wait() freed the per-worker array. Querying _core
+        # here would return empty lists.
+        payload["scheduler_stats"] = rep.scheduler_stats or []
+        payload["queue_stats"] = rep.queue_stats or []
     sys.stdout.write("\n" + SENTINEL_BEGIN + "\n")
     sys.stdout.write(json.dumps(payload, default=_json_default))
     sys.stdout.write("\n" + SENTINEL_END + "\n")
@@ -1052,6 +1088,12 @@ def parent_main(args) -> int:
         derived_points.append(cfg)
 
     git_sha = _git_sha()
+
+    # Sidechannel: forward the emit-scheduler-stats flag to children
+    # via an env var. cfg_to_argv stays a pure function of BenchConfig
+    # because the flag is a reporting concern, not a workload knob.
+    if args.emit_scheduler_stats:
+        os.environ[BOCPY_BENCH_EMIT_SCHED_STATS_ENV] = "1"
 
     # Wall-clock estimate for sweep duration.
     startup_slack = 5.0

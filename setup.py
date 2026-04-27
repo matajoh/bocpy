@@ -20,11 +20,21 @@ setup(
     ext_modules=[
         Extension(
             name="bocpy._core",
-            sources=["src/bocpy/_core.c"],
+            sources=["src/bocpy/_core.c", "src/bocpy/compat.c", "src/bocpy/noticeboard.c", "src/bocpy/sched.c", "src/bocpy/tags.c", "src/bocpy/terminator.c"],
         ),
         Extension(
             name="bocpy._math",
-            sources=["src/bocpy/_math.c"],
+            sources=["src/bocpy/_math.c", "src/bocpy/compat.c"],
+        ),
+        Extension(
+            name="bocpy._internal_test",
+            sources=[
+                "src/bocpy/_internal_test.c",
+                "src/bocpy/_internal_test_atomics.c",
+                "src/bocpy/_internal_test_bq.c",
+                "src/bocpy/compat.c",
+                "src/bocpy/sched.c",
+            ],
         ),
 
     ]

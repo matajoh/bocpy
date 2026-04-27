@@ -569,18 +569,32 @@ def wait(timeout: Optional[float] = None):
     """Block until all behaviors complete, with optional timeout.
 
     On a successful return the runtime is **stopped**: workers are
-    joined, the noticeboard thread exits, the export tempdir is removed,
-    and the terminator is closed. The next ``@when`` call (or explicit
-    :func:`start`) will spin up a fresh runtime.
+    joined, the noticeboard thread exits, the C-level noticeboard
+    slot is released, and the terminator is closed. The next
+    ``@when`` call (or explicit :func:`start`) will spin up a fresh
+    runtime.
 
     Note that holding on to references to Cown objects such that they
     are deallocated after wait() is called results in undefined behavior.
 
     :param timeout: Maximum number of seconds to wait, or ``None`` to
         wait indefinitely. The timeout bounds only the quiescence and
-        noticeboard-drain phases; worker shutdown and tempdir cleanup
-        run to completion regardless.
+        noticeboard-drain phases; worker shutdown runs to completion
+        regardless. Values above ``1e9`` seconds (~31.7 years) are
+        clamped to wait-forever to avoid platform ``time_t`` /
+        ``DWORD`` overflow inside the underlying condition-variable
+        wait.
     :type timeout: Optional[float]
+    :raises RuntimeError: If the noticeboard thread does not exit
+        before the timeout (or, on a retry call, is still alive).
+        The first failure carries the message prefix
+        ``"noticeboard thread did not shut down within timeout=..."``;
+        subsequent retry failures carry
+        ``"noticeboard thread still pinned on retry ..."``. Workers
+        and the orphan-behavior drain have already completed by the
+        time either is raised, so the runtime is intentionally left
+        re-drivable: callers may retry ``wait()`` / ``stop()`` once
+        the in-flight noticeboard mutation finishes.
     """
 
 
@@ -617,10 +631,6 @@ def start(**kwargs):
     :param worker_count: The number of worker interpreters to start.  If
         ``None``, defaults to the number of available cores minus one.
     :type worker_count: Optional[int]
-    :param export_dir: The directory to which the target module will be
-        exported for worker import.  If ``None``, a temporary directory
-        will be created and removed on shutdown.
-    :type export_dir: Optional[str]
     :param module: A tuple of the target module name and file path to
         export for worker import.  If ``None``, the caller's module will
         be used.
