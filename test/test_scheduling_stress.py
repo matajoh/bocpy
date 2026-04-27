@@ -664,13 +664,12 @@ class TestChainRingPerWorkerCount:
             results = _collect_done(ring_size)
             total = sum(count for _, count in results)
             assert total == 2 * ring_length, (worker_count, results)
-
-            # Snapshot stats BEFORE wait() — the per-worker array is
-            # freed in teardown.
-            stats = _core.scheduler_stats()
         finally:
             _drain_done()
-            wait()
+            # `wait(stats=True)` returns the snapshot captured before
+            # the per-worker array is freed, so we don't need a
+            # pre-wait `_core.scheduler_stats()` call.
+            stats = wait(stats=True)
             assert _core.terminator_count() == 0
 
         assert len(stats) == worker_count, stats

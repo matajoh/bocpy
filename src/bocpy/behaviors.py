@@ -192,6 +192,14 @@ class Behaviors:
         # come. The retry path skips straight to the noticeboard
         # cleanup that the prior attempt could not complete.
         self._workers_stopped = False
+        # Per-worker scheduler_stats() snapshot captured at the moment
+        # workers have replied "shutdown" but BEFORE
+        # `_core.scheduler_runtime_stop()` frees the per-worker array.
+        # Surfaced to the caller via `wait(stats=True)`. ``None`` means
+        # no snapshot was captured (e.g. start_workers failed before any
+        # worker registered, or stop_workers raised before reaching the
+        # capture point).
+        self._final_stats: Optional[list[dict]] = None
         self.final_cowns: tuple[Cown, ...] = ()
         self.bid = 0
 
@@ -313,6 +321,20 @@ class Behaviors:
             self._stop_drain_errors = self._drain_orphan_behaviors()
         finally:
             try:
+                # Snapshot the per-worker scheduler counters before
+                # the per-worker array is freed. Workers have already
+                # replied "shutdown" and exited their do_work loops,
+                # so their counters are stable. Surfaced to the
+                # caller via `wait(stats=True)`. Best-effort: any
+                # failure here must not block teardown.
+                try:
+                    self._final_stats = _core.scheduler_stats()
+                except Exception as snap_ex:
+                    self.logger.warning(
+                        "stop_workers(): failed to snapshot scheduler_stats: %r",
+                        snap_ex,
+                    )
+                    self._final_stats = None
                 # Free the per-worker scheduler array now that no
                 # worker thread can observe it. Paired with the
                 # `scheduler_runtime_start` call in `start()`. Run
@@ -1107,8 +1129,16 @@ def when(*cowns):
     return when_factory
 
 
-def wait(timeout: Optional[float] = None):
-    """Block until all behaviors complete, with optional timeout."""
+def wait(timeout: Optional[float] = None, *, stats: bool = False):
+    """Block until all behaviors complete, with optional timeout.
+
+    When ``stats=True``, returns the per-worker
+    :func:`_core.scheduler_stats` snapshot captured at shutdown
+    (after all behaviors have run, before the per-worker array is
+    freed). When ``stats=False`` (the default), returns ``None``.
+    Returns ``[]`` if the runtime was never started or the snapshot
+    could not be captured.
+    """
     global BEHAVIORS
     if BEHAVIORS:
         # Clear BEHAVIORS only if stop() drove the runtime all the
@@ -1123,9 +1153,19 @@ def wait(timeout: Optional[float] = None):
             BEHAVIORS.stop(timeout)
         except BaseException:
             if BEHAVIORS._teardown_complete:
+                snapshot = BEHAVIORS._final_stats
                 BEHAVIORS = None
+                if stats:
+                    return snapshot if snapshot is not None else []
             raise
+        snapshot = BEHAVIORS._final_stats
         BEHAVIORS = None
+        if stats:
+            return snapshot if snapshot is not None else []
+        return None
+    if stats:
+        return []
+    return None
 
 
 def _validate_noticeboard_key(key: str) -> None:

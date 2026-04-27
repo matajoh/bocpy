@@ -4468,9 +4468,10 @@ static PyObject *_core_scheduler_stats(PyObject *Py_UNUSED(module),
       return NULL;
     }
     PyObject *d = Py_BuildValue(
-        "{s:n,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+        "{s:n,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
         "worker_index", i,
         "pushed_local", (unsigned long long)s.pushed_local,
+        "pushed_pending", (unsigned long long)s.pushed_pending,
         "pushed_remote", (unsigned long long)s.pushed_remote,
         "popped_local", (unsigned long long)s.popped_local,
         "popped_via_steal", (unsigned long long)s.popped_via_steal,

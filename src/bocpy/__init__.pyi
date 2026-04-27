@@ -565,7 +565,7 @@ def notice_sync(timeout: Optional[float] = 30.0) -> int:
     """
 
 
-def wait(timeout: Optional[float] = None):
+def wait(timeout: Optional[float] = None, *, stats: bool = False):
     """Block until all behaviors complete, with optional timeout.
 
     On a successful return the runtime is **stopped**: workers are
@@ -585,6 +585,19 @@ def wait(timeout: Optional[float] = None):
         ``DWORD`` overflow inside the underlying condition-variable
         wait.
     :type timeout: Optional[float]
+    :param stats: If ``True``, return the per-worker
+        :func:`_core.scheduler_stats` snapshot captured at shutdown
+        (after every behavior has run, before the per-worker array
+        is freed). This is the only reliable way to read the
+        scheduler counters for the session that just ended --
+        calling :func:`_core.scheduler_stats` after :func:`wait`
+        returns ``[]`` because the per-worker array has already been
+        reclaimed. Returns ``[]`` if the runtime was never started
+        or the snapshot could not be captured.
+    :type stats: bool
+    :return: ``None`` when ``stats=False``; otherwise the per-worker
+        stats list (same shape as :func:`_core.scheduler_stats`).
+    :rtype: Optional[list[dict]]
     :raises RuntimeError: If the noticeboard thread does not exit
         before the timeout (or, on a retry call, is still alive).
         The first failure carries the message prefix

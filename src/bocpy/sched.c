@@ -515,6 +515,8 @@ int boc_sched_stats_snapshot(Py_ssize_t worker_index,
   const boc_sched_stats_atomic_t *src = &WORKERS[worker_index].stats;
   out->pushed_local = boc_atomic_load_u64_explicit(
       (boc_atomic_u64_t *)&src->pushed_local, BOC_MO_RELAXED);
+  out->pushed_pending = boc_atomic_load_u64_explicit(
+      (boc_atomic_u64_t *)&src->pushed_pending, BOC_MO_RELAXED);
   out->pushed_remote = boc_atomic_load_u64_explicit(
       (boc_atomic_u64_t *)&src->pushed_remote, BOC_MO_RELAXED);
   out->popped_local = boc_atomic_load_u64_explicit(
@@ -911,6 +913,17 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
     if (pending != NULL) {
       boc_bq_enqueue(&self->q, pending);
       boc_atomic_fetch_add_u64_explicit(&self->stats.pushed_local, 1,
+                                        BOC_MO_RELAXED);
+    } else {
+      // Producer-locality bypass: dispatch into an empty `pending`
+      // slot. No queue push, no atomic queue-side state mutation,
+      // but bump `pushed_pending` so the dispatched-work total
+      // remains reconcilable as
+      // `pushed_local + pushed_pending + pushed_remote`. Without
+      // this bump the queue's `pushed_local` underreports total
+      // dispatched work whenever steady-state pop-then-dispatch
+      // keeps `pending` empty most cycles.
+      boc_atomic_fetch_add_u64_explicit(&self->stats.pushed_pending, 1,
                                         BOC_MO_RELAXED);
     }
     pending = n;

@@ -202,7 +202,25 @@ bool boc_bq_is_empty(boc_bq_t *q);
 /// and accept torn reads — the snapshot is best-effort, not a barrier.
 typedef struct boc_sched_stats {
   /// @brief Behaviours the worker pushed onto its own queue.
+  /// @details Bumped only on the producer-local arm of
+  /// @ref boc_sched_dispatch when an existing @c pending occupant
+  /// is evicted to the queue to make room for the new dispatch.
+  /// Dispatches that install into an empty @c pending slot bump
+  /// @ref pushed_pending instead. Total dispatched per worker
+  /// (sum across producers) reconciles as
+  /// @c pushed_local + pushed_pending + pushed_remote.
   uint64_t pushed_local;
+  /// @brief Behaviours dispatched into an empty @c pending slot on
+  /// the producer-local arm of @ref boc_sched_dispatch.
+  /// @details The 1-deep producer-locality bypass: if @c pending is
+  /// NULL when @c boc_sched_dispatch fires, the new node is parked
+  /// in @c pending (no queue push) and this counter is bumped. Without
+  /// this counter the queue's @c pushed_local underreports total
+  /// dispatched work whenever the producer is steady-state
+  /// (pop-then-dispatch keeps @c pending empty most cycles), which
+  /// makes contention-on-queue gates look quiet even when the
+  /// dispatch path is saturated.
+  uint64_t pushed_pending;
   /// @brief Behaviours this worker pushed onto another worker's queue
   /// via the round-robin dispatch path.
   uint64_t pushed_remote;
@@ -270,6 +288,7 @@ typedef struct boc_sched_stats {
 /// than a memcpy).
 typedef struct boc_sched_stats_atomic {
   boc_atomic_u64_t pushed_local;
+  boc_atomic_u64_t pushed_pending;
   boc_atomic_u64_t pushed_remote;
   boc_atomic_u64_t popped_local;
   boc_atomic_u64_t popped_via_steal;

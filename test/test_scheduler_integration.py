@@ -145,8 +145,8 @@ class TestTLSCoverage:
         ``work_cowns`` — those reach ``boc_sched_dispatch`` directly
         (no MCS contention), so the second through Kth dispatches
         each evict ``pending`` and bump ``pushed_local``. Stats are
-        snapshotted **before** ``wait()`` because the per-worker
-        array is freed during teardown.
+        captured via ``wait(stats=True)`` so we read the post-session
+        snapshot taken before the per-worker array is freed.
         """
         _ensure_quiesced()
         W = 4  # noqa: N806
@@ -160,34 +160,33 @@ class TestTLSCoverage:
             for i, (cp, wcs) in enumerate(zip(pin_cowns, work_cowns_per_pin)):
                 _coverage_kickoff(cp, wcs, i)
 
-            # Wait for every kickoff to finish before snapshotting stats.
+            # Wait for every kickoff to finish before tearing down.
             for _ in range(W):
                 tag, _payload = receive("done", RECEIVE_TIMEOUT)
                 assert tag != TIMEOUT, "a kickoff failed to complete"
-
-            stats = _core.scheduler_stats()
-            assert len(stats) == W, stats
-            for s in stats:
-                # TLS coverage: every worker must have done *some* work
-                # that touches its TLS slots. Two equivalent paths
-                # qualify:
-                #   * `pushed_local > 0` — the worker reached the
-                #     producer-local arm of `boc_sched_dispatch`
-                #     (touches `current_worker`, `pending`).
-                #   * `popped_via_steal > 0` — the worker reached the
-                #     work-stealing path in `pop_slow` (touches
-                #     `current_worker`, `steal_victim`, and the
-                #     subsequent splice onto `self->q`).
-                # `popped_local > 0` alone is insufficient: a stolen
-                # node is returned directly from `pop_slow` and does
-                # not bump `popped_local`.
-                assert s["pushed_local"] > 0 or s["popped_via_steal"] > 0, (
-                    f"worker {s['worker_index']} did no TLS-touching "
-                    f"work (no local push, no steal): {s}"
-                )
         finally:
             drain("done")
-            wait()
+            stats = wait(stats=True)
+
+        assert len(stats) == W, stats
+        for s in stats:
+            # TLS coverage: every worker must have done *some* work
+            # that touches its TLS slots. Two equivalent paths
+            # qualify:
+            #   * `pushed_local > 0` — the worker reached the
+            #     producer-local arm of `boc_sched_dispatch`
+            #     (touches `current_worker`, `pending`).
+            #   * `popped_via_steal > 0` — the worker reached the
+            #     work-stealing path in `pop_slow` (touches
+            #     `current_worker`, `steal_victim`, and the
+            #     subsequent splice onto `self->q`).
+            # `popped_local > 0` alone is insufficient: a stolen
+            # node is returned directly from `pop_slow` and does
+            # not bump `popped_local`.
+            assert s["pushed_local"] > 0 or s["popped_via_steal"] > 0, (
+                f"worker {s['worker_index']} did no TLS-touching "
+                f"work (no local push, no steal): {s}"
+            )
 
 
 # ---------------------------------------------------------------------------
