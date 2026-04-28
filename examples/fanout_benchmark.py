@@ -325,6 +325,13 @@ def compute_derived_metrics(stats: Optional[list],
     gate ratio is ``enqueue_cas_retries / (pushed_local +
     pushed_pending)`` on that worker.
 
+    Also computes a **fairness** signal: how evenly the work landed
+    across workers, measured as the coefficient of variation of
+    ``popped_local + popped_via_steal`` across all workers, plus the
+    Gini coefficient of the same vector. Lower is fairer; perfectly
+    balanced (every worker did the same number of behaviors) is
+    ``fairness_cv = 0`` and ``fairness_gini = 0``.
+
     :param stats: Per-worker snapshot from ``wait(stats=True)``.
     :param completed_children: Total child completions over the run.
     :return: A dict with the gate inputs and outputs.
@@ -337,6 +344,12 @@ def compute_derived_metrics(stats: Optional[list],
         "enq_retry_ratio": None,
         "steal_yield": None,
         "idle_ratio": None,
+        "fairness_cv": None,
+        "fairness_gini": None,
+        "worker_pop_min": None,
+        "worker_pop_max": None,
+        "worker_pop_mean": None,
+        "worker_pop_counts": None,
     }
     if not stats:
         return out
@@ -365,6 +378,38 @@ def compute_derived_metrics(stats: Optional[list],
     total_failures = sum(int(w.get("steal_failures", 0)) for w in stats)
     if total_attempts > 0:
         out["idle_ratio"] = total_failures / total_attempts
+
+    # Fairness: distribution of work across workers. We count
+    # popped_local + popped_via_steal per worker — this is what each
+    # worker actually executed (regardless of who pushed it). For a
+    # single-producer fanout the producer worker pushes everything;
+    # fairness measures whether stealing redistributed evenly.
+    pops = [
+        int(w.get("popped_local", 0)) + int(w.get("popped_via_steal", 0))
+        for w in stats
+    ]
+    n = len(pops)
+    total = sum(pops)
+    if n > 0 and total > 0:
+        mean = total / n
+        if n > 1:
+            stdev = statistics.pstdev(pops)
+            out["fairness_cv"] = stdev / mean if mean > 0 else None
+        else:
+            out["fairness_cv"] = 0.0
+        # Gini: 0 is perfectly equal, 1 is maximally unequal.
+        sorted_pops = sorted(pops)
+        cum = 0
+        weighted = 0
+        for i, v in enumerate(sorted_pops, start=1):
+            cum += v
+            weighted += i * v
+        if cum > 0:
+            out["fairness_gini"] = (2 * weighted) / (n * cum) - (n + 1) / n
+        out["worker_pop_min"] = min(pops)
+        out["worker_pop_max"] = max(pops)
+        out["worker_pop_mean"] = mean
+        out["worker_pop_counts"] = pops
     return out
 
 

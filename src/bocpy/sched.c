@@ -1047,22 +1047,15 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
 /// (`schedulerthread.h:237-254`) calling
 /// `WorkStealingQueue::steal` (`workstealingqueue.h:103-114`).
 ///
-/// **Steal-cursor advance — bocpy deviation from verona.** Verona's
-/// `WorkStealingQueue::steal` advances `steal_index` only on the
-/// self-victim branch (`if (&victim == this) { ++steal_index;
-/// return nullptr; }`). On verona's actor-shaped workloads that is
-/// sufficient because successful steals trigger
-/// @ref boc_wsq_enqueue_spread, which repopulates other workers'
-/// sub-queues and breaks up cluster contention on the next round.
-/// bocpy needs to handle a workload verona does not optimise for:
-/// one producer pushes trivial children that complete before they
-/// can themselves become steal targets, so the spread side effect
-/// never chains. With many thieves attacking the same lone victim
-/// in lockstep on `q[idx]`, contention pins them to a single MPMCQ
-/// sub-queue. Pre-incrementing `steal_index` on **every** entry
-/// makes successive calls (and concurrent thieves at slightly
-/// different rates) sample different sub-queues per call, diluting
-/// the cluster.
+/// **Steal-cursor advance.** Verona only advances `steal_index` on
+/// the self-victim case (`if (&victim == this) { ++steal_index;
+/// return nullptr; }`); successful steals from non-self victims
+/// keep the cursor — the next attempt naturally picks a different
+/// victim's *same* sub-queue index, which is the spread the design
+/// relies on (in concert with @ref boc_wsq_enqueue_spread on the
+/// thief side). Verbatim port; an earlier deviation that advanced
+/// the cursor on every entry hurt chain / fanout-cw substantially
+/// (see `60-c4-gate-revision.md`).
 ///
 /// **Splice contract.** `boc_bq_dequeue_all` returns a segment of
 /// every node visible at the call (modulo concurrent enqueuers
@@ -1072,8 +1065,8 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
 /// subsequently attempt to steal from @p self.
 ///
 /// **No-op for self-victim.** A single-worker runtime has
-/// `self->next_in_ring == self`. We return NULL; the steal_index
-/// advance has already happened at function entry.
+/// `self->next_in_ring == self`. Per verona we advance
+/// @c steal_index and return NULL.
 ///
 /// @param self Calling worker (must be non-NULL; caller guarantees).
 /// @return Stolen node, or NULL if (a) the victim was self,
@@ -1096,12 +1089,6 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
   // tail-clean (no bookkeeping on the success path).
   steal_victim = steal_victim->next_in_ring;
 
-  // bocpy deviation: advance steal_index on every entry, not just
-  // on the self-victim branch (verona's behaviour). See
-  // function-level comment above for rationale. The cursor is
-  // owner-only (this worker), so plain pre-increment is sound.
-  size_t vidx = boc_wsq_pre_inc(&self->steal_index);
-
   // Stamp the monotonic timestamp before any other bookkeeping so
   // a snapshot taken concurrently observes the entry even if the
   // call returns NULL early (self-victim, empty victim, etc.).
@@ -1114,11 +1101,12 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
                                     BOC_MO_RELAXED);
 
   // Don't steal from yourself (Verona `WorkStealingQueue::steal`
-  // self-check). Counts as a failure for diagnostic purposes — a
+  // self-check: `if (&victim == this) { ++steal_index; return
+  // nullptr; }`). Counts as a failure for diagnostic purposes — a
   // single-worker runtime will see steal_failures == steal_attempts
-  // which is the expected steady state. The steal_index advance
-  // already happened above.
+  // which is the expected steady state.
   if (victim == self) {
+    boc_wsq_pre_inc(&self->steal_index);
     boc_atomic_fetch_add_u64_explicit(&self->stats.steal_failures, 1,
                                       BOC_MO_RELAXED);
     return NULL;
@@ -1128,6 +1116,7 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
   // steal_index (verona: `victim.queues[steal_index]`, where the
   // index belongs to the calling WSQ — the thief). The cursor is
   // touched only by `self`, so no atomic is needed.
+  size_t vidx = self->steal_index.idx;
   boc_bq_segment_t seg = boc_bq_dequeue_all(&victim->q[vidx]);
 
   // Try to take the head off the segment.
