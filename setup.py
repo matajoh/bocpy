@@ -32,6 +32,7 @@ setup(
                 "src/bocpy/_internal_test.c",
                 "src/bocpy/_internal_test_atomics.c",
                 "src/bocpy/_internal_test_bq.c",
+                "src/bocpy/_internal_test_wsq.c",
                 "src/bocpy/compat.c",
                 "src/bocpy/sched.c",
             ],

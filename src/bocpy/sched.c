@@ -377,7 +377,17 @@ int boc_sched_init(Py_ssize_t worker_count) {
     // POSIX, SRWLock / CONDITION_VARIABLE on MSVC).
     for (Py_ssize_t i = 0; i < worker_count; ++i) {
       boc_sched_worker_t *w = &WORKERS[i];
-      boc_bq_init(&w->q);
+      // Initialise all N sub-queues of the WSQ. Cursors are
+      // zero-initialised by the parent `PyMem_RawCalloc` of the
+      // WORKERS array; we re-set them here to make the invariant
+      // explicit and survive any future move to non-zeroing
+      // allocators.
+      for (size_t j = 0; j < (size_t)BOC_WSQ_N; ++j) {
+        boc_bq_init(&w->q[j]);
+      }
+      w->enqueue_index.idx = 0;
+      w->dequeue_index.idx = 0;
+      w->steal_index.idx = 0;
       boc_mtx_init(&w->cv_mu);
       cnd_init(&w->cv);
       // owner_interp_id is set when the worker calls
@@ -470,7 +480,10 @@ void boc_sched_shutdown(void) {
     // this point — `boc_bq_destroy_assert_empty` aborts if not.
     for (Py_ssize_t i = old_count - 1; i >= 0; --i) {
       boc_sched_worker_t *w = &WORKERS[i];
-      boc_bq_destroy_assert_empty(&w->q);
+      // Tear down all N sub-queues; each must be empty.
+      for (size_t j = 0; j < (size_t)BOC_WSQ_N; ++j) {
+        boc_bq_destroy_assert_empty(&w->q[j]);
+      }
       cnd_destroy(&w->cv);
       mtx_destroy(&w->cv_mu);
     }
@@ -705,7 +718,7 @@ boc_bq_node_t *boc_sched_worker_pop_slow(boc_sched_worker_t *self) {
     // the fairness tax.
     if (boc_atomic_load_bool_explicit(&self->should_steal_for_fairness,
                                       BOC_MO_ACQUIRE)
-        && !boc_bq_is_empty(&self->q)) {
+        && !boc_wsq_is_empty(self)) {
       boc_atomic_fetch_add_u64_explicit(&self->stats.fairness_arm_fires, 1,
                                         BOC_MO_RELAXED);
       boc_bq_node_t *stolen = boc_sched_steal(self);
@@ -714,7 +727,7 @@ boc_bq_node_t *boc_sched_worker_pop_slow(boc_sched_worker_t *self) {
       boc_bq_node_t *tok = (boc_bq_node_t *)boc_atomic_load_ptr_explicit(
           &self->token_work, BOC_MO_ACQUIRE);
       if (tok != NULL) {
-        boc_bq_enqueue(&self->q, tok);
+        boc_wsq_enqueue(self, tok);
       }
       if (stolen != NULL) {
         return stolen;
@@ -736,7 +749,7 @@ boc_bq_node_t *boc_sched_worker_pop_slow(boc_sched_worker_t *self) {
     //
     // Verona `get_work:165`. With the fairness arm cleared (or
     // skipped) this is the primary work source.
-    boc_bq_node_t *n = boc_bq_dequeue(&self->q);
+    boc_bq_node_t *n = boc_wsq_dequeue(self);
     if (n != NULL) {
       return n;
     }
@@ -787,7 +800,7 @@ boc_bq_node_t *boc_sched_worker_pop_slow(boc_sched_worker_t *self) {
       continue;
     }
 #else
-    if (!boc_bq_is_empty(&self->q)) {
+    if (!boc_wsq_is_empty(self)) {
       continue;
     }
 #endif
@@ -861,11 +874,11 @@ boc_bq_node_t *boc_sched_worker_pop_fast(boc_sched_worker_t *self) {
   // cost it has always had.
   if (boc_atomic_load_bool_explicit(&self->should_steal_for_fairness,
                                     BOC_MO_ACQUIRE)
-      && !boc_bq_is_empty(&self->q)) {
+      && !boc_wsq_is_empty(self)) {
     return NULL;
   }
 
-  boc_bq_node_t *n = boc_bq_dequeue(&self->q);
+  boc_bq_node_t *n = boc_wsq_dequeue(self);
   if (n != NULL) {
     // Any successful queue dequeue resets the budget; if pending was
     // bypassed because batch had hit 0, count this as a batch_reset
@@ -911,7 +924,7 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
     // prior occupant is a free local handoff that costs nothing
     // measurable.
     if (pending != NULL) {
-      boc_bq_enqueue(&self->q, pending);
+      boc_wsq_enqueue(self, pending);
       boc_atomic_fetch_add_u64_explicit(&self->stats.pushed_local, 1,
                                         BOC_MO_RELAXED);
     } else {
@@ -967,7 +980,7 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
       rr_incarnation = inc_now;
     }
     target = rr_nonlocal;
-    boc_bq_enqueue(&target->q, n);
+    boc_wsq_enqueue(target, n);
     boc_atomic_fetch_add_u64_explicit(&target->stats.pushed_remote, 1,
                                       BOC_MO_RELAXED);
     rr_nonlocal = rr_nonlocal->next_in_ring;
@@ -1011,43 +1024,60 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
 // Port of the work-stealing primitive from
 // `verona-rt/src/rt/sched/schedulerthread.h::try_steal` plus the
 // underlying queue-level steal at
-// `verona-rt/src/rt/sched/workstealingqueue.h::steal`. bocpy has one
-// `boc_bq_t` per worker (Verona's `WorkStealingQueue<N=4>` segment
-// fan-out is not ported), so the segment-spread / WrapIndex
-// machinery is absent; the rest of the protocol — `dequeue_all`,
-// `take_one`, single-element handling, splice-rest-onto-thief — is a
-// direct line-for-line port.
+// `verona-rt/src/rt/sched/workstealingqueue.h::steal`. Each worker
+// owns a `boc_bq_t q[BOC_WSQ_N]` sub-queue array; this thief reads
+// the victim's sub-queue indexed by `self->steal_index` (verona's
+// `this->steal_index`) and `enqueue_spread`s the remainder across
+// its own N sub-queues to dilute thief-vs-thief contention on
+// subsequent steals.
 //
 // `boc_sched_try_steal` is the **single-victim** fast attempt: at
-// most one `dequeue_all` call against `steal_victim->q`, then the
-// cursor advances unconditionally so the next attempt visits a
-// different victim regardless of outcome. The slow multi-victim
-// loop with quiescence timeout (Verona's `steal()`) follows.
+// most one `dequeue_all` call against `victim->q[steal_index]`,
+// then the per-thread victim cursor advances unconditionally so the
+// next attempt visits a different victim regardless of outcome. The
+// slow multi-victim loop with quiescence timeout (Verona's
+// `steal()`) follows.
 
 /// @brief Single-victim work-stealing attempt for @p self.
 /// @details Reads the per-thread @c steal_victim cursor (lazy-
 /// initialised to @c self->next_in_ring), tries to steal one node
-/// from the victim's queue, advances the cursor, and returns the
-/// stolen node (or NULL on miss). Verona equivalent:
-/// `SchedulerThread::try_steal` (`schedulerthread.h:237-254`).
+/// from the victim's WSQ sub-queue selected by @c self->steal_index,
+/// advances the victim cursor, and returns the stolen node (or NULL
+/// on miss). Verona equivalent: `SchedulerThread::try_steal`
+/// (`schedulerthread.h:237-254`) calling
+/// `WorkStealingQueue::steal` (`workstealingqueue.h:103-114`).
 ///
-/// **Splice contract.** `boc_bq_dequeue_all` returns a segment
-/// containing every node visible at the call (modulo concurrent
-/// enqueuers mid-link). After taking one node off the head we
-/// splice the remainder onto @p self->q via
-/// @c boc_bq_enqueue_segment so the work is now reachable from
-/// the thief's own queue and from any future thief that steals
-/// from @p self.
+/// **Steal-cursor advance — bocpy deviation from verona.** Verona's
+/// `WorkStealingQueue::steal` advances `steal_index` only on the
+/// self-victim branch (`if (&victim == this) { ++steal_index;
+/// return nullptr; }`). On verona's actor-shaped workloads that is
+/// sufficient because successful steals trigger
+/// @ref boc_wsq_enqueue_spread, which repopulates other workers'
+/// sub-queues and breaks up cluster contention on the next round.
+/// bocpy needs to handle a workload verona does not optimise for:
+/// one producer pushes trivial children that complete before they
+/// can themselves become steal targets, so the spread side effect
+/// never chains. With many thieves attacking the same lone victim
+/// in lockstep on `q[idx]`, contention pins them to a single MPMCQ
+/// sub-queue. Pre-incrementing `steal_index` on **every** entry
+/// makes successive calls (and concurrent thieves at slightly
+/// different rates) sample different sub-queues per call, diluting
+/// the cluster.
+///
+/// **Splice contract.** `boc_bq_dequeue_all` returns a segment of
+/// every node visible at the call (modulo concurrent enqueuers
+/// mid-link). After taking the head we splice the remainder via
+/// @ref boc_wsq_enqueue_spread so the work is reachable from all
+/// of @p self's sub-queues — diluting collisions when more thieves
+/// subsequently attempt to steal from @p self.
 ///
 /// **No-op for self-victim.** A single-worker runtime has
-/// `self->next_in_ring == self`. Verona handles this in the queue
-/// itself (`WorkStealingQueue::steal` returns nullptr for
-/// `&victim == this` and advances `steal_index`); bocpy handles it
-/// at the thief level — the cursor advances and we return NULL.
+/// `self->next_in_ring == self`. We return NULL; the steal_index
+/// advance has already happened at function entry.
 ///
 /// @param self Calling worker (must be non-NULL; caller guarantees).
 /// @return Stolen node, or NULL if (a) the victim was self,
-///         (b) the victim's queue was empty, or (c) the steal
+///         (b) the victim's sub-queue was empty, or (c) the steal
 ///         spuriously failed (link not yet visible). The caller
 ///         decides whether to retry against the next victim or
 ///         park.
@@ -1060,11 +1090,17 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
   }
 
   boc_sched_worker_t *victim = steal_victim;
-  // Advance the cursor unconditionally. Verona does this after the
-  // steal call (whether the call returned work or not); placing the
-  // store before the work-doing code keeps the function tail-clean
-  // (no bookkeeping on the success path).
+  // Advance the victim cursor unconditionally. Verona does this
+  // after the steal call (whether the call returned work or not);
+  // placing the store before the work-doing code keeps the function
+  // tail-clean (no bookkeeping on the success path).
   steal_victim = steal_victim->next_in_ring;
+
+  // bocpy deviation: advance steal_index on every entry, not just
+  // on the self-victim branch (verona's behaviour). See
+  // function-level comment above for rationale. The cursor is
+  // owner-only (this worker), so plain pre-increment is sound.
+  size_t vidx = boc_wsq_pre_inc(&self->steal_index);
 
   // Stamp the monotonic timestamp before any other bookkeeping so
   // a snapshot taken concurrently observes the entry even if the
@@ -1080,14 +1116,19 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
   // Don't steal from yourself (Verona `WorkStealingQueue::steal`
   // self-check). Counts as a failure for diagnostic purposes — a
   // single-worker runtime will see steal_failures == steal_attempts
-  // which is the expected steady state.
+  // which is the expected steady state. The steal_index advance
+  // already happened above.
   if (victim == self) {
     boc_atomic_fetch_add_u64_explicit(&self->stats.steal_failures, 1,
                                       BOC_MO_RELAXED);
     return NULL;
   }
 
-  boc_bq_segment_t seg = boc_bq_dequeue_all(&victim->q);
+  // Pick the victim's sub-queue indexed by *this thief's*
+  // steal_index (verona: `victim.queues[steal_index]`, where the
+  // index belongs to the calling WSQ — the thief). The cursor is
+  // touched only by `self`, so no atomic is needed.
+  boc_bq_segment_t seg = boc_bq_dequeue_all(&victim->q[vidx]);
 
   // Try to take the head off the segment.
   boc_bq_node_t *r = boc_bq_segment_take_one(&seg);
@@ -1098,15 +1139,17 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
     //   3. first link in segment not yet visible (start != NULL,
     //      next_in_queue still NULL).
     //
-    // Case 1: nothing to steal — return NULL.
+    // Case 1: nothing to steal — return NULL. Verona's
+    // `WorkStealingQueue::steal` `if (ls.end == nullptr) return
+    // nullptr;`.
     if (seg.end == NULL) {
       boc_atomic_fetch_add_u64_explicit(&self->stats.steal_failures, 1,
                                         BOC_MO_RELAXED);
       return NULL;
     }
-    // Case 2: the segment IS our stolen node — no remainder to
-    // splice. Verona handles this explicitly in
-    // `WorkStealingQueue::steal` (workstealingqueue.h:103-108).
+    // Case 2: the segment IS our stolen node — verona returns
+    // `ls.start` directly without spreading anything (there is no
+    // remainder). `workstealingqueue.h:107-108`.
     if (seg.start != NULL && seg.end == &seg.start->next_in_queue) {
       r = seg.start;
       boc_atomic_fetch_add_u64_explicit(&self->stats.popped_via_steal, 1,
@@ -1119,24 +1162,22 @@ static boc_bq_node_t *boc_sched_try_steal(boc_sched_worker_t *self) {
     // us (acquire_front succeeded inside dequeue_all) and we
     // cannot safely splice it back into the victim mid-link.
     //
-    // Verona faithful: `WorkStealingQueue::steal`
-    // (workstealingqueue.h:103-114) falls through to
-    // `enqueue_spread(ls); return r;` here, which splices the
-    // partial segment onto the thief's own queue and returns NULL
-    // (r is NULL on this path). bocpy does the same: enqueue the
-    // partial segment onto self->q and return NULL so the caller
-    // re-loops to its own dequeue. The thief will run `seg.start`
-    // and any items that subsequently link through it via the
-    // normal MPMCQ ordering rules.
-    boc_bq_segment_t partial = {seg.start, seg.end};
-    boc_bq_enqueue_segment(&self->q, partial);
+    // Verona faithful: `WorkStealingQueue::steal` falls through to
+    // `enqueue_spread(ls); return r;` here, with `r == nullptr`.
+    // We do the same — spread the partial segment onto our own
+    // sub-queues and return NULL so the caller re-loops to its own
+    // dequeue.
+    boc_wsq_enqueue_spread(self, seg);
     boc_atomic_fetch_add_u64_explicit(&self->stats.steal_failures, 1,
                                       BOC_MO_RELAXED);
     return NULL;
   }
 
-  // Common case: head taken; splice the rest onto self->q.
-  boc_bq_enqueue_segment(&self->q, seg);
+  // Common case: head taken; spread the rest across self's N
+  // sub-queues so subsequent thieves stealing from self see N
+  // independent targets instead of one. Verona:
+  // `enqueue_spread(ls); return r;`.
+  boc_wsq_enqueue_spread(self, seg);
   boc_atomic_fetch_add_u64_explicit(&self->stats.popped_via_steal, 1,
                                     BOC_MO_RELAXED);
   return r;
@@ -1232,7 +1273,7 @@ static boc_bq_node_t *boc_sched_steal(boc_sched_worker_t *self) {
     BOC_SCHED_YIELD();
 
     // Own-queue catch (Verona schedulerthread.h:269-272).
-    boc_bq_node_t *n = boc_bq_dequeue(&self->q);
+    boc_bq_node_t *n = boc_wsq_dequeue(self);
     if (n != NULL) {
       return n;
     }
@@ -1340,7 +1381,7 @@ bool boc_sched_any_work_visible(void) {
   // stale `false` is acceptable: the epoch re-check under `cv_mu`
   // catches it before the parker sleeps.
   for (Py_ssize_t i = 0; i < wc; ++i) {
-    if (!boc_bq_is_empty(&WORKERS[i].q)) {
+    if (!boc_wsq_is_empty(&WORKERS[i])) {
       return true;
     }
   }

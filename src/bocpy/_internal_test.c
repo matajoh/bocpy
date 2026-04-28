@@ -24,6 +24,7 @@
 
 extern int boc_internal_test_register_atomics(PyObject *module);
 extern int boc_internal_test_register_bq(PyObject *module);
+extern int boc_internal_test_register_wsq(PyObject *module);
 
 /// @brief Multi-phase init: register the test methods on the module.
 /// @details Single-phase init re-enables the GIL on free-threaded
@@ -38,6 +39,9 @@ static int _internal_test_exec(PyObject *m) {
     return -1;
   }
   if (boc_internal_test_register_bq(m) < 0) {
+    return -1;
+  }
+  if (boc_internal_test_register_wsq(m) < 0) {
     return -1;
   }
   return 0;

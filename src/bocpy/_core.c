@@ -4833,7 +4833,7 @@ static PyObject *_core_scheduler_drain_all_queues(
       continue;
     }
     for (;;) {
-      boc_bq_node_t *n = boc_bq_dequeue(&w->q);
+      boc_bq_node_t *n = boc_wsq_dequeue(w);
       if (n == NULL) {
         break;
       }

@@ -190,6 +190,73 @@ boc_bq_node_t *boc_bq_segment_take_one(boc_bq_segment_t *s);
 bool boc_bq_is_empty(boc_bq_t *q);
 
 // ---------------------------------------------------------------------------
+// Verona work-stealing queue cursors (`boc_wsq_*`)
+// ---------------------------------------------------------------------------
+//
+// Port of `verona-rt/src/rt/sched/workstealingqueue.h` and
+// `ds/wrapindex.h`. A WSQ is N independent `boc_bq_t` sub-queues
+// indexed by three plain-`size_t` cursors:
+//   - `enqueue_index`: producer side; pre-increment then push.
+//   - `dequeue_index`: owner pop side; pre-increment then pop, try
+//                       all N before declaring empty.
+//   - `steal_index`: thief side; selects which of the *victim*'s
+//                     sub-queues to drain in a steal attempt.
+//
+// All three cursors are owned by the worker that owns the WSQ.
+// `enqueue_index` is touched by every thread that pushes onto this
+// worker (including remote producers). The race on it is benign:
+// (1) `size_t` aligned loads/stores are atomic at the hardware level
+// on every ISA bocpy supports; (2) `(idx + 1) % N` is always in
+// `[0, N)` regardless of what value was read; (3) the underlying
+// `boc_bq_t` is multi-producer-safe; (4) the only observable effect
+// is distribution quality, bounded by concurrent-producer count.
+// Verona-rt accepts the same race; we make no deviation.
+//
+// Step 1: declarations only. Nothing in the worker struct routes
+// through these helpers yet — that wiring lands in step 2.
+
+/// @brief Number of sub-queues per worker WSQ.
+/// @details Matches verona-rt's `WorkStealingQueue<4>` template
+/// instantiation in `core.h`. Tunable at compile time; see
+/// `61-c4-implementation-plan.md` §"`BOC_WSQ_N`".
+#ifndef BOC_WSQ_N
+#define BOC_WSQ_N 4
+#endif
+
+/// @brief Plain-`size_t` cursor mirroring verona-rt's
+///        `WrapIndex<N>` (`ds/wrapindex.h`).
+/// @details No atomic; the race on `enqueue_index` between
+/// concurrent producers is benign (see header block above).
+typedef struct boc_wsq_cursor {
+  /// @brief Current index in `[0, BOC_WSQ_N)`.
+  size_t idx;
+} boc_wsq_cursor_t;
+
+/// @brief Pre-increment the cursor (returns the new index).
+/// @details Mirrors `WrapIndex::operator++()` (`ds/wrapindex.h`):
+/// `index = (index + 1) % N; return index;`. Used by
+/// `enqueue` and the owner-side `dequeue` loop.
+/// @param c The cursor (must be non-NULL).
+/// @return The post-increment index in `[0, BOC_WSQ_N)`.
+static inline size_t boc_wsq_pre_inc(boc_wsq_cursor_t *c) {
+  c->idx = (c->idx + 1u) % (size_t)BOC_WSQ_N;
+  return c->idx;
+}
+
+/// @brief Post-decrement the cursor (returns the old index).
+/// @details Mirrors `WrapIndex::operator--(int)`
+/// (`ds/wrapindex.h`): `auto r = index; index = (r==0?N-1:r-1);
+/// return r;`. Used by `enqueue_front` to push at the head of the
+/// most-recently-popped sub-queue.
+/// @param c The cursor (must be non-NULL).
+/// @return The pre-decrement index in `[0, BOC_WSQ_N)`.
+static inline size_t boc_wsq_post_dec(boc_wsq_cursor_t *c) {
+  size_t r = c->idx;
+  c->idx = (r == 0u) ? ((size_t)BOC_WSQ_N - 1u) : (r - 1u);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler instrumentation
 // ---------------------------------------------------------------------------
 
@@ -343,7 +410,10 @@ typedef struct boc_sched_worker boc_sched_worker_t;
 /// for the pad computation. Keeping the two field lists in sync is
 /// enforced by a `static_assert` after the real struct definition.
 struct boc_sched_worker_payload_ {
-  boc_bq_t q;
+  boc_bq_t q[BOC_WSQ_N];
+  boc_wsq_cursor_t enqueue_index;
+  boc_wsq_cursor_t dequeue_index;
+  boc_wsq_cursor_t steal_index;
   boc_atomic_ptr_t token_work;
   boc_atomic_bool_t should_steal_for_fairness;
   boc_atomic_bool_t stop_requested;
@@ -368,7 +438,14 @@ struct boc_sched_worker_payload_ {
 
 /// @brief Per-worker scheduler state.
 /// @details All field semantics:
-///   - @c q: this worker's MPMC behaviour queue.
+///   - @c q: this worker's WSQ — array of @ref BOC_WSQ_N independent
+///     MPMC behaviour sub-queues. Pushes / pops / steals select a
+///     sub-queue via the three cursors below; mirrors verona-rt's
+///     `WorkStealingQueue<N>::queues[N]`.
+///   - @c enqueue_index / @c dequeue_index / @c steal_index:
+///     plain-`size_t` cursors (`boc_wsq_cursor_t`) ported from
+///     verona-rt's `WrapIndex<N>`. See the header block above
+///     @ref boc_wsq_cursor_t for the benign-race rationale.
 ///   - @c token_work: fairness token's queue node.
 ///   - @c should_steal_for_fairness: flag set when the fairness
 ///     token is popped; consumed by @ref boc_sched_worker_pop_slow.
@@ -394,7 +471,22 @@ struct boc_sched_worker {
   /// definition is a C++ extension; placing the alignment on the
   /// first member is the portable C equivalent and raises the
   /// containing struct's alignment requirement to match).
-  alignas(BOC_SCHED_CACHELINE) boc_bq_t q;
+  ///
+  /// @details `q` is an array of `BOC_WSQ_N` independent MPMC sub-
+  /// queues; pushes / pops / steals route through different sub-
+  /// queues selected by the three cursors below. Mirrors
+  /// `WorkStealingQueue<N>::queues[N]` (verona-rt).
+  alignas(BOC_SCHED_CACHELINE) boc_bq_t q[BOC_WSQ_N];
+  /// @brief Producer cursor (`++` then push). Touched by every
+  /// thread that dispatches onto this worker; the race is benign
+  /// (see header block above @ref boc_wsq_cursor_t).
+  boc_wsq_cursor_t enqueue_index;
+  /// @brief Owner-pop cursor (`++` then pop, try all N before
+  /// declaring empty). Owner-only.
+  boc_wsq_cursor_t dequeue_index;
+  /// @brief Thief cursor selecting which of a *victim*'s sub-
+  /// queues to drain. Owner-only (this worker, when stealing).
+  boc_wsq_cursor_t steal_index;
   boc_atomic_ptr_t token_work;
   boc_atomic_bool_t should_steal_for_fairness;
   boc_atomic_bool_t stop_requested;
@@ -417,6 +509,101 @@ static_assert(sizeof(boc_sched_worker_t) % BOC_SCHED_CACHELINE == 0,
               "boc_sched_worker_t must be cacheline-multiple in size");
 static_assert(alignof(boc_sched_worker_t) >= BOC_SCHED_CACHELINE,
               "boc_sched_worker_t must be cacheline-aligned");
+
+// ---------------------------------------------------------------------------
+// Verona work-stealing queue helpers (`boc_wsq_*`)
+// ---------------------------------------------------------------------------
+//
+// Inline routing wrappers around the per-worker WSQ. They mirror
+// verona-rt's `WorkStealingQueue<N>` member functions one-for-one;
+// the underlying `boc_bq_*` MPMCQ is unchanged. Each wrapper takes a
+// `boc_sched_worker_t *` rather than a bare `boc_bq_t *` because the
+// cursor lives on the worker.
+
+/// @brief Push a single node onto a worker's WSQ.
+/// @details Mirrors `WorkStealingQueue::enqueue` (verona-rt
+/// `workstealingqueue.h`): pre-increments @c enqueue_index then
+/// pushes onto `q[idx]`. Safe to call from any thread; the cursor
+/// race is benign (see header block above @ref boc_wsq_cursor_t).
+/// @param w The target worker (must be non-NULL).
+/// @param n The node to enqueue (must be non-NULL).
+static inline void boc_wsq_enqueue(boc_sched_worker_t *w, boc_bq_node_t *n) {
+  size_t idx = boc_wsq_pre_inc(&w->enqueue_index);
+  boc_bq_enqueue(&w->q[idx], n);
+}
+
+/// @brief Owner-side pop from a worker's WSQ.
+/// @details Mirrors `WorkStealingQueue::dequeue` (verona-rt
+/// `workstealingqueue.h`): for `i in [0, N)`, pre-increment
+/// @c dequeue_index and try `boc_bq_dequeue(&q[idx])`; return the
+/// first non-NULL. Owner-only — @c dequeue_index has no atomic.
+/// @param w The owning worker (must be non-NULL).
+/// @return A behaviour node, or NULL if all N sub-queues appear
+///         empty (best-effort; same spurious-NULL caveat as
+///         @ref boc_bq_dequeue).
+static inline boc_bq_node_t *boc_wsq_dequeue(boc_sched_worker_t *w) {
+  for (size_t i = 0; i < (size_t)BOC_WSQ_N; ++i) {
+    size_t idx = boc_wsq_pre_inc(&w->dequeue_index);
+    boc_bq_node_t *n = boc_bq_dequeue(&w->q[idx]);
+    if (n != NULL) {
+      return n;
+    }
+  }
+  return NULL;
+}
+
+/// @brief Best-effort emptiness test across all N sub-queues.
+/// @details Mirrors `WorkStealingQueue::is_empty` (verona-rt
+/// `workstealingqueue.h`): scans every sub-queue; first non-empty
+/// short-circuits to `false`. Result may be stale by the time the
+/// caller acts on it — same caveat as @ref boc_bq_is_empty.
+/// @param w The worker to inspect (must be non-NULL).
+/// @return @c true if all N sub-queues currently appear empty.
+static inline bool boc_wsq_is_empty(boc_sched_worker_t *w) {
+  for (size_t i = 0; i < (size_t)BOC_WSQ_N; ++i) {
+    if (!boc_bq_is_empty(&w->q[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// @brief Spread a segment across @p self's WSQ sub-queues.
+/// @details Mirrors `WorkStealingQueue::enqueue_spread` (verona-rt
+/// `workstealingqueue.h`):
+/// @code
+///   while ((n = ls.take_one()) != nullptr) enqueue(n);
+///   enqueue(ls);  // residual tail goes onto one sub-queue
+/// @endcode
+/// Each `take_one` peels one node off the head of the segment; the
+/// node is pushed via @ref boc_wsq_enqueue, which pre-increments
+/// @c enqueue_index so successive nodes round-robin across the N
+/// sub-queues. The final residual (typically a single node, or in
+/// the mid-link-race case a partial segment we cannot drain) is
+/// enqueued as a segment onto one freshly-chosen sub-queue.
+///
+/// Caller invariant: @p ls is non-empty (the steal-loop exit
+/// conditions guarantee this — fully empty and single-element
+/// segments are handled before falling through to spread).
+/// @param self The thief worker (must be non-NULL).
+/// @param ls   The segment to redistribute.
+static inline void boc_wsq_enqueue_spread(boc_sched_worker_t *self,
+                                          boc_bq_segment_t ls) {
+  for (;;) {
+    boc_bq_node_t *n = boc_bq_segment_take_one(&ls);
+    if (n == NULL) {
+      break;
+    }
+    boc_wsq_enqueue(self, n);
+  }
+  // Tail residual: verona pushes the final segment unconditionally
+  // onto a single sub-queue via `++enqueue_index`. With N=4 and
+  // typical steal segments of dozens of nodes, the spreading has
+  // already happened; the tail is at most a singleton (or a
+  // mid-link partial we could not drain).
+  size_t idx = boc_wsq_pre_inc(&self->enqueue_index);
+  boc_bq_enqueue_segment(&self->q[idx], ls);
+}
 
 /// @brief Initialise the scheduler module for a fresh runtime cycle.
 /// @details Allocates the per-worker array of length @p worker_count
