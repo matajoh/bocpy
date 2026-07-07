@@ -547,6 +547,65 @@ class TestMatmul:
                 assert bits(c1[i, j]) == bits(acc)
                 assert bits(c2[i, j]) == bits(c1[i, j])
 
+    def test_matmul_method_matches_operator(self, matmul_pair):
+        """``a.matmul(b)`` is bit-for-bit identical to ``a @ b``."""
+        a, b, m, k, n = matmul_pair
+        method = a.matmul(b)
+        operator = a @ b
+        assert method.rows == m
+        assert method.columns == n
+        for i in range(m):
+            for j in range(n):
+                assert struct.pack("<d", method[i, j]) == struct.pack(
+                    "<d", operator[i, j]
+                )
+
+    def test_matmul_method_out(self, matmul_pair):
+        """``out=`` writes into the target and returns it, no fresh alloc."""
+        a, b, m, k, n = matmul_pair
+        out = Matrix(m, n)
+        result = a.matmul(b, out=out)
+        assert result is out
+        expected = a @ b
+        for i in range(m):
+            for j in range(n):
+                assert out[i, j] == pytest.approx(expected[i, j], rel=1e-9)
+
+    def test_matmul_method_out_aliases_operand(self):
+        """``out=`` aliasing an operand still gives the correct product.
+
+        matmul zeroes and accumulates into its destination, so an aliased
+        target would clobber the input mid-product without the scratch-buffer
+        guard. Both square-operand aliases (self and other) are exercised.
+        """
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
+        expected = list((a @ b).values())
+
+        into_self = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        other = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
+        assert into_self.matmul(other, out=into_self) is into_self
+        assert list(into_self.values()) == expected
+
+        this = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        into_other = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
+        assert this.matmul(into_other, out=into_other) is into_other
+        assert list(into_other.values()) == expected
+
+    def test_matmul_method_shape_mismatch(self):
+        """Incompatible inner dimensions raise ValueError."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        b = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(ValueError):
+            a.matmul(b)
+
+    def test_matmul_method_out_wrong_shape(self):
+        """An ``out=`` whose shape != the product raises ValueError."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        b = Matrix(3, 4, [float(x) for x in range(12)])
+        with pytest.raises(ValueError):
+            a.matmul(b, out=Matrix(2, 2))
+
 
 @pytest.mark.parametrize("in_place_mode", [False, True], ids=["copy", "in_place"])
 class TestTranspose:

@@ -382,6 +382,27 @@ class Matrix:
         :raises TypeError: if *out* is given and is not a :class:`Matrix`.
         """
 
+    def matmul(self, other: "Matrix", /, *,
+               out: Optional["Matrix"] = None) -> "Matrix":
+        """Matrix product ``self @ other`` -- the method form of ``@``.
+
+        An ``M0 x N0`` times ``N0 x N1`` matmul giving an ``M0 x N1`` result,
+        bit-for-bit identical to the ``@`` operator. Unlike the element-wise
+        methods this is not element-wise, so *out* may **not** alias an
+        operand for an allocation gain: when it does, the product is computed
+        into a scratch buffer and copied back.
+
+        :param other: The right-hand operand, whose row count must equal
+            ``self``'s column count.
+        :param out: An ``M0 x N1`` :class:`Matrix` to write the result into
+            (allocation-free unless it aliases an operand); returned in place
+            of a fresh matrix.
+        :return: ``self @ other`` (``out`` itself when ``out`` is given).
+        :raises ValueError: if the inner dimensions disagree, or if *out*'s
+            shape does not match the ``M0 x N1`` result.
+        :raises TypeError: if *out* is given and is not a :class:`Matrix`.
+        """
+
     def divide(self, other: Union["Matrix", int, float], /, *,
                out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self / other`` -- the method form of ``/``.

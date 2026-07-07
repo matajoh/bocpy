@@ -6868,6 +6868,76 @@ exit:
   return out_op;
 }
 
+/* Named-method form of the ``@`` operator: self.matmul(other, *, out=None).
+   Mirrors Matrix_matmul but adds the keyword-only ``out=`` target shared by
+   the element-wise named methods. Unlike those, matmul is not element-wise:
+   impl_matmul zeroes its destination before accumulating, so an ``out=`` that
+   aliases an operand would clobber the input mid-product. When out overlaps
+   lhs or rhs the product is computed into a scratch buffer and copied back;
+   otherwise it is written straight into the target. */
+static PyObject *Matrix_matmul_method(PyObject *self, PyObject *args,
+                                      PyObject *kwds) {
+  PyObject *other = NULL;
+  PyObject *out_target = NULL;
+  static char *kwlist[] = {"", "out", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|$O", kwlist, &other,
+                                   &out_target)) {
+    return NULL;
+  }
+
+  matrix_impl *lhs = NULL;
+  matrix_impl *rhs = NULL;
+  matrix_impl *scratch = NULL;
+  PyObject *out_op = NULL;
+
+  lhs = unwrap_matrix(self, false);
+  if (lhs == NULL) {
+    goto exit;
+  }
+  rhs = unwrap_matrix(other, false);
+  if (rhs == NULL) {
+    goto exit;
+  }
+  if (lhs->columns != rhs->rows) {
+    PyErr_SetString(PyExc_ValueError, "M0xN0 @ M1xN1  N0 != M1");
+    goto exit;
+  }
+
+  if (out_target != NULL && out_target != Py_None) {
+    matrix_impl *out =
+        use_out_target(out_target, &out_op, lhs->rows, rhs->columns);
+    if (out == NULL) {
+      goto exit;
+    }
+    if (out == lhs || out == rhs) {
+      scratch = impl_new(lhs->rows, rhs->columns);
+      if (scratch == NULL) {
+        Py_CLEAR(out_op);
+        goto exit;
+      }
+      impl_matmul(lhs, rhs, scratch);
+      memcpy(out->data, scratch->data, out->size * sizeof(double));
+    } else {
+      impl_matmul(lhs, rhs, out);
+    }
+  } else {
+    matrix_impl *out = impl_new(lhs->rows, rhs->columns);
+    if (out == NULL) {
+      goto exit;
+    }
+    impl_matmul(lhs, rhs, out);
+    out_op = wrap_impl_or_free(out);
+  }
+
+exit:
+  if (scratch != NULL) {
+    impl_free(scratch);
+  }
+  IMPL_DECREF(lhs);
+  IMPL_DECREF(rhs);
+  return out_op;
+}
+
 Py_ssize_t Matrix_length(PyObject *op) {
   MatrixObject *self = (MatrixObject *)op;
   matrix_impl *impl = self->impl;
@@ -7814,6 +7884,17 @@ static PyMethodDef Matrix_methods[] = {
      "is written there and returned instead of allocating a new matrix; out "
      "may alias an input. Bit-for-bit identical to ``self * other``. A shape "
      "mismatch between out and the result raises ValueError before any write."},
+    {"matmul", (PyCFunction)Matrix_matmul_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "matmul($self, other, /, *, out=None)\n--\n\n"
+     "Matrix product ``self @ other``: an M0xN0 times N0xN1 matmul giving an "
+     "M0xN1 result. The named-method form of the ``@`` operator, bit-for-bit "
+     "identical to it. With ``out`` (an M0xN1 matrix) the result is written "
+     "there and returned instead of allocating a new matrix; unlike the "
+     "element-wise methods, out may not alias an operand for a size gain -- "
+     "when it does, the product is computed into a scratch buffer and copied "
+     "back. Raises ValueError if the inner dimensions disagree, or if out's "
+     "shape does not match the M0xN1 result."},
     {"divide", (PyCFunction)Matrix_divide_method, METH_VARARGS | METH_KEYWORDS,
      "divide($self, other, /, *, out=None)\n--\n\n"
      "Element-wise ``self / other`` with the same broadcasting as ``/`` "
